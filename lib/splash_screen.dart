@@ -1,7 +1,10 @@
 ﻿import 'dart:async';
+import 'dart:io';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'permission_screen.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'camera_inspection_screen.dart';
 
 class SplashScreen extends StatefulWidget {
   const SplashScreen({super.key});
@@ -15,7 +18,7 @@ class _SplashScreenState extends State<SplashScreen>
   late final AnimationController _controller;
   late final Animation<double> _fadeAnimation;
   late final Animation<double> _scaleAnimation;
-  Timer? _navigationTimer;
+  Timer? _timer;
 
   @override
   void initState() {
@@ -39,26 +42,42 @@ class _SplashScreenState extends State<SplashScreen>
 
     _controller.forward();
 
-    _navigationTimer = Timer(const Duration(seconds: 3), _navigateToNext);
+    _timer = Timer(const Duration(seconds: 3), _checkPermissionAndProceed);
   }
 
-  void _navigateToNext() {
+  Future<void> _checkPermissionAndProceed() async {
     if (!mounted) return;
-    Navigator.of(context).pushReplacement(
-      PageRouteBuilder(
-        transitionDuration: const Duration(milliseconds: 600),
-        pageBuilder: (context, animation, secondaryAnimation) =>
-            const PermissionScreen(),
-        transitionsBuilder: (context, animation, secondaryAnimation, child) {
-          return FadeTransition(opacity: animation, child: child);
-        },
-      ),
-    );
+
+    // Check status first
+    PermissionStatus status = await Permission.camera.status;
+    if (!status.isGranted) {
+      // Trigger default system permission dialog without custom UI
+      status = await Permission.camera.request();
+    }
+
+    if (!mounted) return;
+
+    if (status.isGranted) {
+      Navigator.of(context).pushReplacement(
+        PageRouteBuilder(
+          transitionDuration: const Duration(milliseconds: 500),
+          pageBuilder: (context, animation, secondaryAnimation) =>
+              const CameraInspectionScreen(),
+          transitionsBuilder: (context, animation, secondaryAnimation, child) {
+            return FadeTransition(opacity: animation, child: child);
+          },
+        ),
+      );
+    } else {
+      // If permission is denied, exit app gracefully
+      SystemNavigator.pop();
+      exit(0);
+    }
   }
 
   @override
   void dispose() {
-    _navigationTimer?.cancel();
+    _timer?.cancel();
     _controller.dispose();
     super.dispose();
   }
