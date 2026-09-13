@@ -1,7 +1,8 @@
-﻿import 'dart:io';
+import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 import 'dart:ui';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:onnxruntime/onnxruntime.dart';
 import 'package:path_provider/path_provider.dart';
@@ -33,16 +34,19 @@ class InferenceService {
   /// and returns the local absolute file path for the C++ native engine.
   Future<String> _resolveModelFilePath() async {
     final docsDir = await getApplicationDocumentsDirectory();
-    final modelFile = File('/yolov8n.onnx');
+    final modelFile = File('${docsDir.path}/yolov8n.onnx');
 
-    // Only copy if not already cached or empty
     if (!await modelFile.exists() || await modelFile.length() == 0) {
+      debugPrint("Copying yolov8n.onnx asset to: ${modelFile.path}");
       final ByteData data = await rootBundle.load('assets/models/yolov8n.onnx');
       final Uint8List bytes = data.buffer.asUint8List(
         data.offsetInBytes,
         data.lengthInBytes,
       );
       await modelFile.writeAsBytes(bytes, flush: true);
+      debugPrint("Asset copied successfully, size: ${bytes.length} bytes");
+    } else {
+      debugPrint("Using cached model file: ${modelFile.path} (${await modelFile.length()} bytes)");
     }
 
     return modelFile.path;
@@ -52,16 +56,23 @@ class InferenceService {
   Future<void> initialize() async {
     if (_isInitialized) return;
 
-    OrtEnv.instance.init();
-    _runOptions = OrtRunOptions();
+    try {
+      debugPrint("Initializing OrtEnv...");
+      OrtEnv.instance.init();
+      _runOptions = OrtRunOptions();
 
-    final sessionOptions = OrtSessionOptions();
-    final String localModelPath = await _resolveModelFilePath();
-    final File modelFile = File(localModelPath);
+      final sessionOptions = OrtSessionOptions();
+      final String localModelPath = await _resolveModelFilePath();
+      final File modelFile = File(localModelPath);
 
-    // Initialize session directly from local file path
-    _session = OrtSession.fromFile(modelFile, sessionOptions);
-    _isInitialized = true;
+      debugPrint("Creating OrtSession from file: $localModelPath");
+      _session = OrtSession.fromFile(modelFile, sessionOptions);
+      _isInitialized = true;
+      debugPrint("OrtSession initialized successfully. Inputs: ${_session?.inputNames}, Outputs: ${_session?.outputNames}");
+    } catch (e, stack) {
+      debugPrint("Failed to initialize OrtSession: $e\n$stack");
+      rethrow;
+    }
   }
 
   /// Passes [inputTensor] with shape [1, 3, 640, 640] to the ONNX session
@@ -124,10 +135,10 @@ class InferenceService {
 
   /// Decodes [1, 84, 8400] YOLOv8 outputs:
   /// Transposes columns to 8400 rows of 84 elements (cx, cy, w, h + 80 class confidence scores),
-  /// filters candidates with maxScore > 0.45, and applies Non-Maximum Suppression (IoU >= 0.45).
+  /// filters candidates with maxScore > confThreshold, and applies Non-Maximum Suppression (IoU >= 0.45).
   List<Detection> decodeYoloOutput(
     List<double> output, {
-    double confThreshold = 0.45,
+    double confThreshold = 0.15,
     double iouThreshold = 0.45,
   }) {
     const int numCandidates = 8400;
@@ -135,10 +146,13 @@ class InferenceService {
     const double modelInputSize = 640.0;
 
     if (output.length < 84 * numCandidates) {
+      debugPrint("Output tensor length too short: ${output.length} vs expected ${84 * numCandidates}");
       return [];
     }
 
     final List<Detection> candidates = [];
+    double overallMaxConfidence = 0.0;
+    String topLabel = "none";
 
     // Output is column-major: row r, col c -> index = r * 8400 + c
     // r=0: cx, r=1: cy, r=2: w, r=3: h, r=4..83: classes
@@ -152,6 +166,13 @@ class InferenceService {
           maxScore = score;
           bestClassId = c;
         }
+      }
+
+      if (maxScore > overallMaxConfidence) {
+        overallMaxConfidence = maxScore;
+        topLabel = (bestClassId >= 0 && bestClassId < cocoLabels.length)
+            ? cocoLabels[bestClassId]
+            : "unknown";
       }
 
       if (maxScore > confThreshold && bestClassId >= 0) {
@@ -168,11 +189,11 @@ class InferenceService {
 
         final label = bestClassId < cocoLabels.length
             ? cocoLabels[bestClassId]
-            : 'class_';
+            : "class_$bestClassId";
 
         // Capitalize first letter for display (e.g., 'laptop' -> 'Laptop')
         final displayLabel = label.isNotEmpty
-            ? ''
+            ? '${label[0].toUpperCase()}${label.substring(1)}'
             : label;
 
         candidates.add(
@@ -185,6 +206,8 @@ class InferenceService {
         );
       }
     }
+
+    debugPrint("Tensor output shape: [1, 84, 8400], Max confidence found: ${overallMaxConfidence.toStringAsFixed(4)} ($topLabel), Candidates: ${candidates.length}");
 
     return _nonMaximumSuppression(candidates, iouThreshold);
   }

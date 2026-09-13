@@ -1,4 +1,4 @@
-﻿import 'package:flutter/material.dart';
+import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'detection_model.dart';
 
@@ -79,7 +79,7 @@ class BoundingBoxPainter extends CustomPainter {
 
       // Label & Confidence text: e.g. Laptop 92%
       final int confidencePercent = (detection.confidence * 100).round();
-      final String badgeText = ' %';
+      final String badgeText = '${detection.label} $confidencePercent%';
 
       final textSpan = TextSpan(
         text: badgeText,

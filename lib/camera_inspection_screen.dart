@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -43,8 +43,8 @@ class _CameraInspectionScreenState extends State<CameraInspectionScreen>
   Future<void> _initInferenceEngine() async {
     try {
       await _inferenceService.initialize();
-    } catch (e) {
-      debugPrint('Failed to initialize InferenceService: ');
+    } catch (e, stack) {
+      debugPrint('Failed to initialize InferenceService: $e\n$stack');
     }
   }
 
@@ -130,6 +130,7 @@ class _CameraInspectionScreenState extends State<CameraInspectionScreen>
     if (controller == null || !controller.value.isInitialized) return;
 
     controller.startImageStream((CameraImage image) {
+      debugPrint("Frame received -> isProcessing: $_isProcessing, serviceReady: ${_inferenceService.isInitialized}");
       _processFrame(image);
     });
   }
@@ -174,10 +175,10 @@ class _CameraInspectionScreenState extends State<CameraInspectionScreen>
       final int latency = stopwatch.elapsedMilliseconds;
 
       if (rawOutput.isNotEmpty && mounted) {
-        // Decode 8400 candidate rows, extract maxScore > 0.45 and apply NMS
+        // Decode 8400 candidate rows with 0.15 threshold for debug verification
         final List<Detection> detections = _inferenceService.decodeYoloOutput(
           rawOutput,
-          confThreshold: 0.45,
+          confThreshold: 0.15,
           iouThreshold: 0.45,
         );
 
@@ -187,8 +188,8 @@ class _CameraInspectionScreenState extends State<CameraInspectionScreen>
           _latencyMs = latency;
         });
       }
-    } catch (e) {
-      debugPrint('Inference processing error: ');
+    } catch (e, stack) {
+      debugPrint("Inference error: $e\n$stack");
     } finally {
       _isProcessing = false;
     }
