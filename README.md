@@ -7,13 +7,13 @@
 ![YOLOv8](https://img.shields.io/badge/Model-YOLOv8n-purple)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
-<p align="center">
-  <img src="assets/screen_1.jpg" alt="Live detection screenshot" width="280"/>
-  <img src="assets/screen_2.jpg" alt="Telemetry panel screenshot" width="280"/>
+<p align="start">
+  <img src="assets/screen_1.jpg" alt="Live detection screenshot" width="280"/>  &nbsp; 
+  <img src="assets/screen_2.jpg" alt="Telemetry panel screenshot" width="280"/>&nbsp;
   <img src="assets/screen_3.jpg" alt="Telemetry panel screenshot" width="280"/>
 </p>
 
-> 📸 *Add your own screen captures to `docs/screenshots/` and update the paths above.*
+
 
 ---
 
