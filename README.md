@@ -8,8 +8,8 @@
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 <p align="start">
-  <img src="assets/screen_1.jpg" alt="Live detection screenshot" width="250"/>  &nbsp; 
-  <img src="assets/screen_2.jpg" alt="Telemetry panel screenshot" width="250"/> &nbsp;
+  <img src="assets/screen_1.jpg" alt="Live detection screenshot" width="250"/>  &nbsp; &nbsp; 
+  <img src="assets/screen_2.jpg" alt="Telemetry panel screenshot" width="250"/> &nbsp; &nbsp; 
   <img src="assets/screen_3.jpg" alt="Telemetry panel screenshot" width="250"/>
 </p>
 
