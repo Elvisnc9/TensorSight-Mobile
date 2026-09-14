@@ -35,7 +35,7 @@ dependencies:
   # Use with the CupertinoIcons class for iOS style icons.
   cupertino_icons: ^1.0.8
   camera: ^0.12.0+2
-  onnxruntime: ^1.4.1
+  flutter_onnxruntime: ^1.8.5
   permission_handler: 11.3.1
   google_fonts: ^8.2.1
   path_provider: ^2.1.6

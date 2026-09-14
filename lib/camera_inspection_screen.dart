@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:isolate';
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -7,6 +8,35 @@ import 'bounding_box_painter.dart';
 import 'detection_model.dart';
 import 'image_preprocessor.dart';
 import 'inference_service.dart';
+
+/// Request message sent to the background preprocessing isolate
+class _WorkerTask {
+  final CameraFrameData frameData;
+  final SendPort replyPort;
+
+  _WorkerTask({
+    required this.frameData,
+    required this.replyPort,
+  });
+}
+
+/// Top-level worker isolate entrypoint
+void _preprocessWorkerEntry(SendPort mainSendPort) {
+  final workerReceivePort = ReceivePort();
+  mainSendPort.send(workerReceivePort.sendPort);
+
+  workerReceivePort.listen((message) {
+    if (message is _WorkerTask) {
+      try {
+        final result = preprocessCameraImage(message.frameData);
+        message.replyPort.send(result);
+      } catch (e, stack) {
+        debugPrint('Worker isolate preprocessing error: $e\n$stack');
+        message.replyPort.send(null);
+      }
+    }
+  });
+}
 
 class CameraInspectionScreen extends StatefulWidget {
   const CameraInspectionScreen({super.key});
@@ -18,6 +48,7 @@ class CameraInspectionScreen extends StatefulWidget {
 class _CameraInspectionScreenState extends State<CameraInspectionScreen>
     with WidgetsBindingObserver {
   CameraController? _controller;
+  CameraDescription? _cameraDescription;
   List<CameraDescription> _cameras = [];
   bool _isCameraInitialized = false;
   String? _errorMessage;
@@ -28,11 +59,41 @@ class _CameraInspectionScreenState extends State<CameraInspectionScreen>
   int _latencyMs = 0;
   int _activeObjectCount = 0;
 
+  // Frame-throttling counter: process 1 frame every 2 frames for smooth 60fps UI
+  int _frameCounter = 0;
+  static const int _frameSkip = 2;
+
+  // Persistent background worker isolate
+  Isolate? _workerIsolate;
+  SendPort? _workerSendPort;
+  Completer<void>? _workerReadyCompleter;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    _spawnWorkerIsolate();
     _initializeAll();
+  }
+
+  /// Spawns a persistent background Isolate once
+  Future<void> _spawnWorkerIsolate() async {
+    try {
+      _workerReadyCompleter = Completer<void>();
+      final initPort = ReceivePort();
+      _workerIsolate = await Isolate.spawn(
+        _preprocessWorkerEntry,
+        initPort.sendPort,
+        debugName: 'PreprocessWorkerIsolate',
+      );
+      final sendPort = await initPort.first as SendPort;
+      _workerSendPort = sendPort;
+      initPort.close();
+      _workerReadyCompleter?.complete();
+      debugPrint('Persistent preprocessing worker isolate ready.');
+    } catch (e, stack) {
+      debugPrint('Failed to spawn worker isolate: $e\n$stack');
+    }
   }
 
   Future<void> _initializeAll() async {
@@ -44,7 +105,7 @@ class _CameraInspectionScreenState extends State<CameraInspectionScreen>
     try {
       await _inferenceService.initialize();
     } catch (e, stack) {
-      debugPrint('Failed to initialize InferenceService: $e\n$stack');
+      debugPrint('Failed to initialize InferenceService: \n');
     }
   }
 
@@ -54,6 +115,8 @@ class _CameraInspectionScreenState extends State<CameraInspectionScreen>
     _stopImageStream();
     _controller?.dispose();
     _inferenceService.dispose();
+    _workerIsolate?.kill(priority: Isolate.immediate);
+    _workerIsolate = null;
     super.dispose();
   }
 
@@ -95,6 +158,8 @@ class _CameraInspectionScreenState extends State<CameraInspectionScreen>
         orElse: () => _cameras.first,
       );
 
+      _cameraDescription = camera;
+
       final controller = CameraController(
         camera,
         ResolutionPreset.medium,
@@ -130,7 +195,6 @@ class _CameraInspectionScreenState extends State<CameraInspectionScreen>
     if (controller == null || !controller.value.isInitialized) return;
 
     controller.startImageStream((CameraImage image) {
-      debugPrint("Frame received -> isProcessing: $_isProcessing, serviceReady: ${_inferenceService.isInitialized}");
       _processFrame(image);
     });
   }
@@ -144,8 +208,14 @@ class _CameraInspectionScreenState extends State<CameraInspectionScreen>
   }
 
   void _processFrame(CameraImage image) async {
-    // Drop incoming frame immediately if previous inference is still in flight
-    if (_isProcessing || !_inferenceService.isInitialized || !mounted) {
+    // Frame throttling: skip frames to prevent queue backlog
+    _frameCounter++;
+    if (_frameCounter % _frameSkip != 0) {
+      return;
+    }
+
+    // Gate execution: drop frame if previous is in flight or service is not ready
+    if (_isProcessing || !_inferenceService.isInitialized || !mounted || _workerSendPort == null) {
       return;
     }
 
@@ -153,7 +223,10 @@ class _CameraInspectionScreenState extends State<CameraInspectionScreen>
     final stopwatch = Stopwatch()..start();
 
     try {
-      // Pack raw plane data safely for Isolate transmission
+      // Determine camera sensor rotation (typically 90 on Android back camera)
+      final int sensorOrientation = _cameraDescription?.sensorOrientation ?? 90;
+
+      // Pack frame data for isolate
       final frameData = CameraFrameData(
         planes: image.planes.map((p) => Uint8List.fromList(p.bytes)).toList(),
         bytesPerRow: image.planes.map((p) => p.bytesPerRow).toList(),
@@ -161,25 +234,34 @@ class _CameraInspectionScreenState extends State<CameraInspectionScreen>
         width: image.width,
         height: image.height,
         format: image.format.raw,
+        rotation: sensorOrientation,
       );
 
-      // Preprocess image off the UI thread via compute isolate into normalized 640x640 [1, 3, 640, 640]
-      final Float32List inputTensor = await compute(preprocessCameraImage, frameData);
+      // Preprocess image on persistent worker isolate via dedicated response port
+      final responsePort = ReceivePort();
+      _workerSendPort!.send(_WorkerTask(
+        frameData: frameData,
+        replyPort: responsePort.sendPort,
+      ));
 
-      if (!mounted) return;
+      final preprocessResult = await responsePort.first as PreprocessResult?;
+      responsePort.close();
 
-      // Execute on-device ONNX runtime inference: [1, 3, 640, 640] -> [1, 84, 8400]
-      final List<double> rawOutput = _inferenceService.runInference(inputTensor);
+      if (preprocessResult == null || !mounted) return;
+
+      // Execute on-device ONNX runtime inference
+      final List<double> rawOutput = await _inferenceService.runInference(preprocessResult.tensor);
 
       stopwatch.stop();
       final int latency = stopwatch.elapsedMilliseconds;
 
       if (rawOutput.isNotEmpty && mounted) {
-        // Decode 8400 candidate rows with 0.15 threshold for debug verification
+        // Decode candidate boxes using letterbox unpadding and production threshold (0.40)
         final List<Detection> detections = _inferenceService.decodeYoloOutput(
           rawOutput,
-          confThreshold: 0.15,
+          confThreshold: 0.40,
           iouThreshold: 0.45,
+          letterboxInfo: preprocessResult.letterboxInfo,
         );
 
         setState(() {
@@ -189,7 +271,7 @@ class _CameraInspectionScreenState extends State<CameraInspectionScreen>
         });
       }
     } catch (e, stack) {
-      debugPrint("Inference error: $e\n$stack");
+      debugPrint('Inference error: $e\n$stack');
     } finally {
       _isProcessing = false;
     }
@@ -257,7 +339,7 @@ class _CameraInspectionScreenState extends State<CameraInspectionScreen>
 
     return LayoutBuilder(
       builder: (context, constraints) {
-        // Camera sensor dimensions (rotated in portrait: width is height, height is width)
+        // Camera preview aspect ratio in portrait: width is height, height is width
         final double previewWidth = _controller!.value.previewSize?.height ?? constraints.maxWidth;
         final double previewHeight = _controller!.value.previewSize?.width ?? constraints.maxHeight;
 

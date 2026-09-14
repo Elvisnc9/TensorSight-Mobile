@@ -1,16 +1,14 @@
-import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 import 'dart:ui';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart';
-import 'package:onnxruntime/onnxruntime.dart';
-import 'package:path_provider/path_provider.dart';
+import 'package:flutter_onnxruntime/flutter_onnxruntime.dart';
 import 'detection_model.dart';
+import 'image_preprocessor.dart';
 
 class InferenceService {
+  final OnnxRuntime _ort = OnnxRuntime();
   OrtSession? _session;
-  OrtRunOptions? _runOptions;
   bool _isInitialized = false;
 
   bool get isInitialized => _isInitialized;
@@ -30,92 +28,68 @@ class InferenceService {
     'toothbrush'
   ];
 
-  /// Copies assets/models/yolov8n.onnx to getApplicationDocumentsDirectory()
-  /// and returns the local absolute file path for the C++ native engine.
-  Future<String> _resolveModelFilePath() async {
-    final docsDir = await getApplicationDocumentsDirectory();
-    final modelFile = File('${docsDir.path}/yolov8n.onnx');
-
-    if (!await modelFile.exists() || await modelFile.length() == 0) {
-      debugPrint("Copying yolov8n.onnx asset to: ${modelFile.path}");
-      final ByteData data = await rootBundle.load('assets/models/yolov8n.onnx');
-      final Uint8List bytes = data.buffer.asUint8List(
-        data.offsetInBytes,
-        data.lengthInBytes,
-      );
-      await modelFile.writeAsBytes(bytes, flush: true);
-      debugPrint("Asset copied successfully, size: ${bytes.length} bytes");
-    } else {
-      debugPrint("Using cached model file: ${modelFile.path} (${await modelFile.length()} bytes)");
-    }
-
-    return modelFile.path;
-  }
-
-  /// Initializes ONNX Runtime environment and loads YOLOv8n session from the local file path.
+  /// Initializes ONNX Runtime and loads YOLOv8n directly from the Flutter asset bundle.
+  /// flutter_onnxruntime handles asset resolution internally, so there's no need to
+  /// manually copy the model into the app documents directory (unlike the old
+  /// `onnxruntime` package's OrtSession.fromFile approach).
   Future<void> initialize() async {
     if (_isInitialized) return;
 
     try {
-      debugPrint("Initializing OrtEnv...");
-      OrtEnv.instance.init();
-      _runOptions = OrtRunOptions();
-
-      final sessionOptions = OrtSessionOptions();
-      final String localModelPath = await _resolveModelFilePath();
-      final File modelFile = File(localModelPath);
-
-      debugPrint("Creating OrtSession from file: $localModelPath");
-      _session = OrtSession.fromFile(modelFile, sessionOptions);
+      debugPrint("Creating ONNX session from asset: assets/models/yolov8n.onnx");
+      _session = await _ort.createSessionFromAsset('assets/models/yolov8n.onnx');
       _isInitialized = true;
-      debugPrint("OrtSession initialized successfully. Inputs: ${_session?.inputNames}, Outputs: ${_session?.outputNames}");
+      debugPrint(
+        "OrtSession initialized successfully. "
+        "Inputs: ${_session?.inputNames}, Outputs: ${_session?.outputNames}",
+      );
     } catch (e, stack) {
       debugPrint("Failed to initialize OrtSession: $e\n$stack");
       rethrow;
     }
   }
 
-  /// Passes [inputTensor] with shape [1, 3, 640, 640] to the ONNX session
-  /// Returns raw flattened float output list corresponding to [1, 84, 8400]
-  List<double> runInference(Float32List inputTensor) {
-    if (!_isInitialized || _session == null || _runOptions == null) {
+  /// Passes [inputTensor] with shape [1, 3, 640, 640] to the ONNX session.
+  /// Returns raw flattened double list corresponding to [1, 84, 8400].
+  Future<List<double>> runInference(Float32List inputTensor) async {
+    if (!_isInitialized || _session == null) {
       throw StateError('InferenceService is not initialized');
     }
 
     final inputShape = [1, 3, 640, 640];
-    final inputOrtValue = OrtValueTensor.createTensorWithDataList(
-      inputTensor,
-      inputShape,
-    );
-
     final inputName = _session!.inputNames.isNotEmpty
         ? _session!.inputNames.first
         : 'images';
+    final outputName = _session!.outputNames.isNotEmpty
+        ? _session!.outputNames.first
+        : null;
 
-    final inputs = {inputName: inputOrtValue};
-    final outputs = _session!.run(_runOptions!, inputs);
+    // flutter_onnxruntime's OrtValue.fromList takes (data, shape) — note the
+    // argument order is reversed from the old onnxruntime package's
+    // OrtValueTensor.createTensorWithDataList(data, shape), which is the same
+    // order coincidentally, but double-check if you copy from other examples.
+    final inputValue = await OrtValue.fromList(inputTensor, inputShape);
+    final inputs = {inputName: inputValue};
 
-    // Free native input memory
-    inputOrtValue.release();
+    Map<String, OrtValue> outputs = {};
+    try {
+      outputs = await _session!.run(inputs);
 
-    if (outputs.isEmpty || outputs.first == null) {
-      return [];
-    }
-
-    final firstOutput = outputs.first!;
-    final dynamic rawValue = firstOutput.value;
-
-    // Free native output memory
-    firstOutput.release();
-
-    if (rawValue is List) {
-      if (rawValue.isNotEmpty && rawValue.first is List) {
-        return _flattenRecursive(rawValue);
+      if (outputName == null || !outputs.containsKey(outputName)) {
+        return [];
       }
-      return rawValue.cast<double>();
-    }
 
-    return [];
+      final rawList = await outputs[outputName]!.asList();
+      // asList() returns a flattened (or nested, depending on platform) list —
+      // normalize defensively either way.
+      return _flattenRecursive(rawList);
+    } finally {
+      // Free native memory for both input and output tensors.
+      await inputValue.dispose();
+      for (final value in outputs.values) {
+        await value.dispose();
+      }
+    }
   }
 
   List<double> _flattenRecursive(List list) {
@@ -136,10 +110,12 @@ class InferenceService {
   /// Decodes [1, 84, 8400] YOLOv8 outputs:
   /// Transposes columns to 8400 rows of 84 elements (cx, cy, w, h + 80 class confidence scores),
   /// filters candidates with maxScore > confThreshold, and applies Non-Maximum Suppression (IoU >= 0.45).
+  /// If [letterboxInfo] is provided, letterbox padding is subtracted to normalize accurately.
   List<Detection> decodeYoloOutput(
     List<double> output, {
-    double confThreshold = 0.15,
+    double confThreshold = 0.40,
     double iouThreshold = 0.45,
+    LetterboxInfo? letterboxInfo,
   }) {
     const int numCandidates = 8400;
     const int numClasses = 80;
@@ -153,6 +129,11 @@ class InferenceService {
     final List<Detection> candidates = [];
     double overallMaxConfidence = 0.0;
     String topLabel = "none";
+
+    final double padX = letterboxInfo?.padX ?? 0.0;
+    final double padY = letterboxInfo?.padY ?? 0.0;
+    final double unpaddedW = modelInputSize - 2 * padX;
+    final double unpaddedH = modelInputSize - 2 * padY;
 
     // Output is column-major: row r, col c -> index = r * 8400 + c
     // r=0: cx, r=1: cy, r=2: w, r=3: h, r=4..83: classes
@@ -181,17 +162,19 @@ class InferenceService {
         final double w = output[2 * numCandidates + col];
         final double h = output[3 * numCandidates + col];
 
-        // Convert [cx, cy, w, h] to normalized coordinates [0.0 .. 1.0]
-        final double normLeft = ((cx - w / 2.0) / modelInputSize).clamp(0.0, 1.0);
-        final double normTop = ((cy - h / 2.0) / modelInputSize).clamp(0.0, 1.0);
-        final double normWidth = (w / modelInputSize).clamp(0.0, 1.0);
-        final double normHeight = (h / modelInputSize).clamp(0.0, 1.0);
+        final double boxLeft = cx - w / 2.0;
+        final double boxTop = cy - h / 2.0;
+
+        // Subtract letterbox padding and normalize relative to the unpadded frame
+        final double normLeft = ((boxLeft - padX) / unpaddedW).clamp(0.0, 1.0);
+        final double normTop = ((boxTop - padY) / unpaddedH).clamp(0.0, 1.0);
+        final double normWidth = (w / unpaddedW).clamp(0.0, 1.0);
+        final double normHeight = (h / unpaddedH).clamp(0.0, 1.0);
 
         final label = bestClassId < cocoLabels.length
             ? cocoLabels[bestClassId]
             : "class_$bestClassId";
 
-        // Capitalize first letter for display (e.g., 'laptop' -> 'Laptop')
         final displayLabel = label.isNotEmpty
             ? '${label[0].toUpperCase()}${label.substring(1)}'
             : label;
@@ -260,11 +243,9 @@ class InferenceService {
     return intersectionArea / unionArea;
   }
 
-  void dispose() {
-    _session?.release();
-    _runOptions?.release();
+  Future<void> dispose() async {
+    await _session?.close();
     _session = null;
-    _runOptions = null;
     _isInitialized = false;
   }
 }
